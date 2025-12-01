@@ -1,0 +1,15 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments and dependencies
+.venv/
+venv/
+.env
+
+# Game runtime data
+stats.json
+
+# OS/editor noise
+.DS_Store
+*.log
