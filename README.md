@@ -4,9 +4,11 @@ A terminal-based stealth puzzle game where you navigate through a vault, avoid s
 
 ## 📹 Demo Video
 
-<video src="demo/signal_vault_demo.mp4" controls width="100%"></video>
+[📺 Watch Demo Video](demo/signal_vault_demo.mp4)
 
 *Watch the game in action: Navigate the vault, avoid drones, and experience dynamic AI narration!*
+
+Click the link above to download and view the demo video.
 
 ## 🎮 Game Overview
 
