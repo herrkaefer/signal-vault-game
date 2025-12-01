@@ -1,11 +1,14 @@
 import random
 import sys
+import re
+import shutil
 import tty
 import termios
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
+from audio import AudioEngine
 from narrator import Narrator, get_persona, list_personas
 from stats import StatsManager
 
@@ -124,7 +127,6 @@ class Board:
         self.exit: Coords = (difficulty.size - 1, difficulty.size - 1)
         self.max_health = difficulty.max_health
         self.health = min(difficulty.start_health, difficulty.max_health)
-        self.first_draw = True
         self.message_buffer: List[str] = []
         self.turns_taken = 0
 
@@ -225,37 +227,55 @@ class Board:
                 self.message_buffer = self.message_buffer[-5:]
 
     def draw(self) -> None:
-        # Clear screen and move to home position for in-place update
-        if not self.first_draw:
-            COLORS.clear_screen()
-        self.first_draw = False
-
+        # Always clear screen and move to home position for consistent display
+        COLORS.clear_screen()
         legend = (
             "[P] you  [E] exit  [#] wall  [^] trap (-1 hp)  [+] medkit (+1 hp)  "
             "[D] drone  [H] helper  •  Controls: WASD or Arrow Keys, Q to quit"
         )
-        print(COLORS.cyan(legend))
-        print(
+        header_lines = [
+            COLORS.cyan(legend),
             f"Difficulty: {self.difficulty.name}   "
             f"Health: {self.health}/{self.max_health}   "
-            f"Turn: {self.turns_taken}"
-        )
-        print("    " + " ".join(str(c) for c in range(self.size)))
+            f"Turn: {self.turns_taken}",
+        ]
+        grid_lines = ["    " + " ".join(str(c) for c in range(self.size))]
         for r in range(self.size):
             row = []
             for c in range(self.size):
                 cell = self._cell_repr((r, c))
                 row.append(cell)
-            print(f"{r:>2} | " + " ".join(row))
+            grid_lines.append(f"{r:>2} | " + " ".join(row))
 
-        # Show recent messages below the board
-        print("\n" + COLORS.cyan("=== Recent Events ==="))
+        footer_lines = [COLORS.cyan("=== Recent Events ===")]
+        # Always show exactly 5 lines in footer for consistent positioning
         if self.message_buffer:
-            for msg in self.message_buffer[-5:]:
-                print(msg)
+            recent_messages = self.message_buffer[-5:]
+            # Pad to exactly 5 lines if needed
+            while len(recent_messages) < 5:
+                recent_messages.append("")
+            footer_lines.extend(recent_messages)
         else:
-            print("(No recent events)")
-        print()
+            # Show 5 empty lines to maintain consistent footer height
+            footer_lines.extend(["(No recent events)"] + [""] * 4)
+        footer_lines.append("")  # Final blank line
+
+        # Center only the grid block horizontally.
+        term_width, _ = shutil.get_terminal_size((100, 30))
+        ansi_strip = re.compile(r"\x1b\[[0-9;]*m")
+
+        def visible_len(text: str) -> int:
+            return len(ansi_strip.sub("", text))
+
+        grid_max = max(visible_len(line) for line in grid_lines) if grid_lines else 0
+        grid_pad = " " * max(0, (term_width - grid_max) // 2)
+
+        for line in header_lines:
+            print(line)
+        for line in grid_lines:
+            print(f"{grid_pad}{line}")
+        for line in footer_lines:
+            print(line)
 
     def _cell_repr(self, coord: Coords) -> str:
         if coord == self.player:
@@ -430,9 +450,6 @@ def ask_yes_no(message: str) -> bool:
 
 
 def choose_narrator() -> Narrator:
-    if not ask_yes_no("Enable vibe narrator? (y/n): "):
-        return Narrator.disabled()
-
     personas = list_personas()
     persona_keys = {persona.key for persona in personas}
     print(COLORS.cyan("Choose narrator style:"))
@@ -454,25 +471,31 @@ def choose_narrator() -> Narrator:
             break
         print("Invalid choice. Use the number or persona key.")
 
-    use_ai = False
-    if Narrator.ai_available() and ask_yes_no("Use AI narration (requires OpenAI key)? (y/n): "):
-        use_ai = True
-        print(COLORS.yellow("AI narration enabled. Falling back to offline lines on errors."))
-    elif not Narrator.ai_available():
+    use_ai = Narrator.ai_available()
+    if use_ai:
+        print(COLORS.yellow("AI narration enabled via OPENAI_API_KEY."))
+    else:
         print(COLORS.yellow("AI narration unavailable (missing OPENAI_API_KEY). Using offline lines."))
 
     return Narrator(chosen_persona, use_ai=use_ai)
 
 
-def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats: StatsManager) -> None:
+def play_round(
+    diff_key: str,
+    difficulty: Difficulty,
+    narrator: Narrator,
+    stats: StatsManager,
+    audio: AudioEngine,
+) -> None:
     board = Board(difficulty)
-    narrator.reset_low_health()
+    narrator.reset_round_state()  # Reset all narrator state for new round
     start_line = narrator.describe("start", board.health, board.max_health)
     if start_line:
         board.add_message(COLORS.yellow(start_line))
 
     # Clear screen before starting the game
     COLORS.clear_screen()
+    audio.start_ambient()
 
     result = "quit"
     while True:
@@ -482,6 +505,7 @@ def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats:
             victory_line = narrator.describe("victory", board.health, board.max_health)
             if victory_line:
                 board.add_message(COLORS.yellow(victory_line))
+            audio.play_blocking("victory")  # Play victory sound and wait for it to finish
             result = "victory"
             break
         if board.health <= 0:
@@ -489,11 +513,13 @@ def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats:
             defeat_line = narrator.describe("defeat", board.health, board.max_health)
             if defeat_line:
                 board.add_message(COLORS.yellow(defeat_line))
+            audio.play_blocking("defeat")  # Play defeat sound and wait for it to finish
             result = "defeat"
             break
 
         choice = prompt()
         if choice == "q":
+            narrator.stop_tts()  # Stop TTS immediately before describing quit
             board.add_message("You abandon the run.")
             quit_line = narrator.describe("quit", board.health, board.max_health)
             if quit_line:
@@ -505,27 +531,35 @@ def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats:
             continue
 
         prev_health = board.health
-        board.turns_taken += 1
         notice, move_event = board.handle_player_move(choice)
+        if move_event == "wall":
+            if notice:
+                board.add_message(notice)
+            wall_line = narrator.describe("wall", board.health, board.max_health)
+            if wall_line:
+                board.add_message(COLORS.yellow(wall_line))
+            audio.play("wall")
+            continue
+
+        board.turns_taken += 1
         drone_notice = board.move_drones()
         if notice:
             board.add_message(notice)
-            if move_event == "wall":
-                wall_line = narrator.describe("wall", board.health, board.max_health)
-                if wall_line:
-                    board.add_message(COLORS.yellow(wall_line))
-            elif move_event == "helper":
+            if move_event == "helper":
                 helper_line = narrator.describe("helper", board.health, board.max_health)
                 if helper_line:
                     board.add_message(COLORS.yellow(helper_line))
+                audio.play("helper")
         if board.health < prev_health:
             trap_line = narrator.describe("trap", board.health, board.max_health)
             if trap_line:
                 board.add_message(COLORS.yellow(trap_line))
+            audio.play("trap")
         elif board.health > prev_health:
             medkit_line = narrator.describe("medkit", board.health, board.max_health)
             if medkit_line:
                 board.add_message(COLORS.yellow(medkit_line))
+            audio.play("medkit")
         if (
             board.health > 0
             and board.health <= max(1, board.max_health // 2)
@@ -543,6 +577,7 @@ def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats:
             drone_line = narrator.describe("drone_hit", board.health, board.max_health)
             if drone_line:
                 board.add_message(COLORS.yellow(drone_line))
+            audio.play("drone_hit")
         nearest = board.nearest_drone_distance()
         if (
             nearest is not None
@@ -562,6 +597,7 @@ def play_round(diff_key: str, difficulty: Difficulty, narrator: Narrator, stats:
             if status_line:
                 board.add_message(COLORS.yellow(status_line))
 
+    audio.stop_all()
     stats_result = stats.record_run(diff_key, board.turns_taken, result)
     stats_line = stats.summary_line(diff_key)
     print(COLORS.cyan(f"Stats [{difficulty.name}]: {stats_line}"))
@@ -593,16 +629,33 @@ def main() -> None:
     print("Controls: w/a/s/d to move, q to quit. Walls block movement.")
 
     stats = StatsManager(STATS_PATH, DIFFICULTY_ORDER)
+    audio = AudioEngine(enabled=True)
+    if not audio.player:
+        print(COLORS.yellow("No system audio player found (afplay/aplay). Continuing muted."))
+        audio.enabled = False
 
-    while True:
-        diff_key, difficulty = choose_difficulty()
-        stats_line = stats.summary_line(diff_key)
-        print(COLORS.cyan(f"Stats [{difficulty.name}]: {stats_line}"))
-        narrator = choose_narrator()
-        play_round(diff_key, difficulty, narrator, stats)
-        if not ask_yes_no("Play again? (y/n): "):
-            print("Thanks for running the vault.")
-            break
+    diff_key: Optional[str] = None
+    difficulty: Optional[Difficulty] = None
+    narrator: Optional[Narrator] = None
+
+    try:
+        while True:
+            if difficulty is None or narrator is None:
+                diff_key, difficulty = choose_difficulty()
+                stats_line = stats.summary_line(diff_key)
+                print(COLORS.cyan(f"Stats [{difficulty.name}]: {stats_line}"))
+                narrator = choose_narrator()
+            elif diff_key:
+                # On repeat runs reuse settings but show stats.
+                stats_line = stats.summary_line(diff_key)
+                print(COLORS.cyan(f"Stats [{difficulty.name}]: {stats_line}"))
+
+            play_round(diff_key or "normal", difficulty, narrator, stats, audio)
+            if not ask_yes_no("Play again? (y/n): "):
+                print("Thanks for running the vault.")
+                break
+    finally:
+        audio.cleanup()
 
 
 if __name__ == "__main__":

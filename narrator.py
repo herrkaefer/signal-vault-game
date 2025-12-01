@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import threading
 import queue
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
@@ -350,6 +351,92 @@ def get_persona(key: str) -> Persona:
     return PERSONAS.get(key, PERSONAS["dramatic"])
 
 
+# Persona-specific voice instructions for OpenAI TTS
+# Each persona has distinct voice characteristics that match their narration style
+PERSONA_INSTRUCTIONS: Dict[str, str] = {
+    "dramatic": """Voice Affect: Cinematic, breathless, and theatrical; carries the intensity of a live broadcast commentator.
+
+Tone: Dramatic heist-show host; speaks with breathless excitement and cinematic gravitas—like narrating a high-stakes heist in real-time.
+
+Pacing: Varied and dramatic; breathless during action, slower and more deliberate during tension—let the drama guide tempo. Quicken pace during near-misses and victories.
+
+Emotion: Intensely expressive; let emotions range from quiet intensity to dramatic peaks. Convey urgency, tension, and triumph with full theatricality.
+
+Pronunciation: Powerful and resonant; emphasize dramatic words ("vault", "drone", "shadow", "blackout") and let the voice's depth add cinematic weight.
+
+Pauses: Cinematic pauses; use silence dramatically—brief pauses for tension ("fate leans closer"), longer pauses for impact ("final blackout"). Let dramatic moments land with weight.""",
+
+    "mentor": """Voice Affect: Calm, steady, and composed; projects quiet authority and unwavering confidence.
+
+Tone: Steady, encouraging coach in your earpiece; speaks with measured calm and tactical precision—like a trusted mission control operator.
+
+Pacing: Steady and measured; deliberate enough to ensure clarity and maintain composure, efficient enough to provide timely guidance. Never rushed, even under pressure.
+
+Emotion: Calm and measured; convey concern or encouragement through subtle tone shifts rather than obvious emotion. Maintain steady composure even during tense moments.
+
+Pronunciation: Clear and precise; emphasize tactical information ("vitals", "tiles", "drone") and key instructions. Speak with quiet authority.
+
+Pauses: Brief, thoughtful pauses; pause after delivering status updates or instructions, allowing information to land. Use pauses to emphasize key tactical points.""",
+
+    "humorous": """Voice Affect: Dry, quick-witted, and slightly sardonic; carries a playful edge with deadpan delivery.
+
+Tone: Sarcastic sidekick; speaks with dry humor and quick quips—like a witty companion providing running commentary with a smirk.
+
+Pacing: Quick and snappy; deliver quips with brisk timing, but allow brief pauses for comedic effect. Slightly faster during action, slower for deadpan moments.
+
+Emotion: Dryly expressive; let sarcasm and humor show through subtle tone shifts and timing. Underplay serious moments with deadpan delivery.
+
+Pronunciation: Clear and sharp; emphasize punchlines and witty phrases. Let the dryness come through in delivery rather than emotion.
+
+Pauses: Comedic timing pauses; brief pauses before punchlines, slightly longer pauses for deadpan effect. Use pauses to let sarcasm land.""",
+
+    "cyberpunk": """Voice Affect: Gravelly, atmospheric, and gritty; carries the weight of neon-soaked streets and radio static.
+
+Tone: Cyberpunk DJ with radio static; speaks like a gravel-voiced broadcaster cutting through the noise of a dystopian city—mysterious and streetwise.
+
+Pacing: Varied and atmospheric; slower for atmospheric moments ("neon bleeds"), faster for action bursts ("rotors find flesh"). Let the rhythm match the cyberpunk aesthetic.
+
+Emotion: Restrained intensity; convey urgency and atmosphere through pacing and emphasis rather than obvious emotion. Maintain the gritty, streetwise edge.
+
+Pronunciation: Gritty and resonant; emphasize cyberpunk terminology ("grid", "freqs", "static", "signal") and let the gravelly quality add weight. Speak like cutting through radio interference.
+
+Pauses: Atmospheric pauses; use silence to build atmosphere and tension. Brief pauses for static-like effect, longer pauses for dramatic cyberpunk moments ("channel collapses to black")."""
+}
+
+
+def get_persona_instructions(persona_key: str) -> str:
+    """Get voice instructions for a given persona, with fallback to dramatic."""
+    return PERSONA_INSTRUCTIONS.get(persona_key.lower(), PERSONA_INSTRUCTIONS["dramatic"])
+
+
+# Map each persona to an appropriate OpenAI TTS voice
+PERSONA_VOICES: Dict[str, str] = {
+    "dramatic": "onyx",      # Deep, dramatic, cinematic - perfect for heist-show host
+    "mentor": "coral",       # Calm, composed, reassuring - ideal for steady coach
+    "humorous": "echo",      # Bold, energetic, dynamic - great for sarcastic sidekick
+    "cyberpunk": "ash",      # Deep, resonant, authoritative - matches gravelly DJ
+}
+
+# Map each persona to an appropriate Edge TTS voice (Microsoft Edge TTS)
+# Using voices that match the persona characteristics
+PERSONA_EDGE_VOICES: Dict[str, str] = {
+    "dramatic": "en-US-GuyNeural",      # Deep, expressive male voice
+    "mentor": "en-US-AriaNeural",       # Calm, clear female voice
+    "humorous": "en-US-JennyNeural",    # Energetic, friendly female voice
+    "cyberpunk": "en-US-DavisNeural",   # Deep, resonant male voice
+}
+
+
+def get_persona_voice(persona_key: str) -> str:
+    """Get the appropriate OpenAI TTS voice for a given persona."""
+    return PERSONA_VOICES.get(persona_key.lower(), "onyx")
+
+
+def get_persona_edge_voice(persona_key: str) -> str:
+    """Get the appropriate Edge TTS voice for a given persona."""
+    return PERSONA_EDGE_VOICES.get(persona_key.lower(), "en-US-GuyNeural")
+
+
 class Narrator:
     def __init__(self, persona: Persona, enabled: bool = True, use_ai: bool = False) -> None:
         self.persona = persona
@@ -359,11 +446,19 @@ class Narrator:
         self._last_status_turn = -10
         self._last_tension = "low"
         self._ai_client = self._init_ai_client() if self.use_ai else None
+        self._tts_lock = threading.Lock()
+        self._tts_proc: Optional[subprocess.Popen] = None
 
         # TTS queue and worker thread for non-blocking audio
-        self._tts_queue: queue.Queue = queue.Queue()
-        self._tts_worker = threading.Thread(target=self._tts_worker_loop, daemon=True)
-        self._tts_worker.start()
+        # Initialize TTS queue if either OpenAI or edge-tts is available
+        self._tts_queue: Optional[queue.Queue] = None
+        self._tts_worker: Optional[threading.Thread] = None
+        self._use_edge_tts = not self._ai_client and self.edge_tts_available()
+        if self._ai_client or self._use_edge_tts:
+            self._tts_queue = queue.Queue()
+        if self._tts_queue:
+            self._tts_worker = threading.Thread(target=self._tts_worker_loop, daemon=True)
+            self._tts_worker.start()
 
     @classmethod
     def disabled(cls) -> "Narrator":
@@ -377,6 +472,14 @@ class Narrator:
 
     def low_health_noted(self) -> bool:
         return self._low_health_noted
+
+    def reset_round_state(self) -> None:
+        """Reset narrator state for a new round."""
+        self._low_health_noted = False
+        self._last_status_turn = -10
+        self._last_tension = "low"
+        # Stop any currently playing TTS from previous round
+        self.stop_tts()
 
     def describe(
         self,
@@ -457,6 +560,15 @@ class Narrator:
     def ai_available() -> bool:
         return bool(os.environ.get("OPENAI_API_KEY"))
 
+    @staticmethod
+    def edge_tts_available() -> bool:
+        """Check if edge-tts is available."""
+        try:
+            import edge_tts
+            return True
+        except ImportError:
+            return False
+
     def _init_ai_client(self):
         """Lazy import OpenAI client; return None if unavailable."""
         if not self.ai_available():
@@ -482,21 +594,46 @@ class Narrator:
             except Exception:
                 # Silently continue on errors
                 pass
+        # Cleanup any remaining voice process when shutting down
+        with self._tts_lock:
+            if self._tts_proc and self._tts_proc.poll() is None:
+                try:
+                    self._tts_proc.terminate()
+                except Exception:
+                    pass
+            self._tts_proc = None
 
     def _generate_and_play_tts(self, text: str) -> None:
         """Generate and play TTS audio synchronously (called in background thread)."""
-        if not self._ai_client or not text:
+        if not text:
             return
 
-        # Get TTS voice from environment or use default "onyx" (deep, dramatic)
-        voice = os.environ.get("TTS_VOICE", "onyx")
+        # Use OpenAI TTS if available
+        if self._ai_client:
+            self._generate_openai_tts(text)
+        # Fall back to edge-tts if OpenAI is not available
+        elif self._use_edge_tts:
+            self._generate_edge_tts(text)
+
+    def _generate_openai_tts(self, text: str) -> None:
+        """Generate TTS using OpenAI API."""
+        if not self._ai_client:
+            return
+
+        # Get the appropriate voice for this persona
+        voice = get_persona_voice(self.persona.key)
+        model = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
+
+        # Get persona-specific instructions that match the narrator's style
+        instructions = get_persona_instructions(self.persona.key)
 
         try:
-            # Generate speech using OpenAI TTS API
+            # Generate speech using OpenAI TTS API with persona-specific instructions
             response = self._ai_client.audio.speech.create(
-                model="tts-1",  # Fast TTS model
+                model=model,
                 voice=voice,
                 input=text,
+                instructions=instructions,
                 speed=1.0  # Normal speed, can adjust for pacing
             )
 
@@ -505,29 +642,138 @@ class Narrator:
                 tmp_file.write(response.content)
                 audio_path = tmp_file.name
 
-            # Play audio (blocking in this thread, but thread is background)
-            subprocess.run(
-                ['afplay', audio_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-
-            # Clean up temp file after playback
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
+            self._play_audio_file(audio_path)
 
         except Exception:
             # Silently fail if TTS doesn't work
             pass
 
+    def _generate_edge_tts(self, text: str) -> None:
+        """Generate TTS using edge-tts (Microsoft Edge TTS)."""
+        try:
+            import edge_tts
+        except ImportError:
+            return
+
+        # Get the appropriate edge-tts voice for this persona
+        voice = get_persona_edge_voice(self.persona.key)
+
+        try:
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as tmp_file:
+                audio_path = tmp_file.name
+
+            # Generate speech using edge-tts (async)
+            async def generate():
+                communicate = edge_tts.Communicate(text, voice)
+                await communicate.save(audio_path)
+
+            # Run the async function
+            asyncio.run(generate())
+
+            # Verify file was created and has content
+            if os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                self._play_audio_file(audio_path)
+            else:
+                # Clean up empty file
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
+
+        except Exception as e:
+            # Log error for debugging
+            import sys
+            error_msg = str(e)
+            if "401" in error_msg or "Unauthorized" in error_msg:
+                print(
+                    "edge-tts: Microsoft API authentication failed. "
+                    "This may be a temporary issue. Check https://github.com/rany2/edge-tts/issues for updates.",
+                    file=sys.stderr
+                )
+            else:
+                print(f"edge-tts error: {e}", file=sys.stderr)
+
+    def _play_audio_file(self, audio_path: str) -> None:
+        """Play an audio file using the system player."""
+        try:
+            with self._tts_lock:
+                if self._tts_proc and self._tts_proc.poll() is None:
+                    try:
+                        self._tts_proc.terminate()
+                    except Exception:
+                        pass
+                proc = subprocess.Popen(
+                    ['afplay', audio_path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL
+                )
+                self._tts_proc = proc
+            # Clean up temp file after playback in a small helper thread.
+            threading.Thread(
+                target=self._wait_and_cleanup,
+                args=(proc, audio_path),
+                daemon=True
+            ).start()
+        except Exception:
+            try:
+                os.unlink(audio_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _wait_and_cleanup(proc: subprocess.Popen, path: str) -> None:
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
     def _speak_text(self, text: str) -> None:
         """Queue TTS generation (non-blocking)."""
-        if not self._ai_client or not text:
+        if not self._ai_client or not self._tts_queue or not text:
             return
         # Add to queue for background processing
         self._tts_queue.put(text)
+
+    def stop_tts(self) -> None:
+        """Immediately stop all TTS playback (but keep worker thread alive for reuse)."""
+        # Stop any currently playing audio process immediately
+        with self._tts_lock:
+            if self._tts_proc and self._tts_proc.poll() is None:
+                try:
+                    self._tts_proc.terminate()
+                    # Give it a moment to terminate gracefully
+                    try:
+                        self._tts_proc.wait(timeout=0.5)
+                    except Exception:
+                        # Force kill if it doesn't terminate quickly
+                        try:
+                            self._tts_proc.kill()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                self._tts_proc = None
+
+        # Clear any pending TTS requests from the queue (but don't stop the worker thread)
+        # This allows the narrator to be reused in subsequent rounds
+        if self._tts_queue:
+            try:
+                # Drain the queue to prevent queued messages from playing
+                while True:
+                    try:
+                        self._tts_queue.get_nowait()
+                    except queue.Empty:
+                        break
+            except Exception:
+                pass
 
     def _generate_ai_line(
         self,
