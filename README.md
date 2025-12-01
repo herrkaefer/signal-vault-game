@@ -2,6 +2,8 @@
 
 A terminal-based stealth puzzle game where you navigate through a vault, avoid security drones, collect medkits, and reach the exit—all while being narrated by dynamic AI-powered commentary.
 
+![Signal Vault Screenshot](demo/screenshot.png)
+
 ## 📹 Demo Video
 
 [📺 Watch Demo Video](demo/signal_vault_demo.mp4)
